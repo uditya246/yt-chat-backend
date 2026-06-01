@@ -2,11 +2,10 @@ fastapi
 uvicorn[standard]
 langchain
 langchain-community
-langchain-huggingface
 langchain-text-splitters
 faiss-cpu
 tiktoken
 youtube-transcript-api
-sentence-transformers
 huggingface-hub
 pydantic
+fastembed
