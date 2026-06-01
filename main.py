@@ -6,6 +6,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
+from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import FastEmbedEmbeddings
@@ -25,7 +26,6 @@ app.add_middleware(
 )
 
 # ── Pre-load embedding model at startup ────────────────────────────────────
-# FastEmbed is lightweight (~50MB) — works fine on free tier
 print("Loading embedding model...")
 EMBEDDINGS = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 print("Embedding model loaded!")
@@ -68,6 +68,54 @@ def extract_video_id(url_or_id: str) -> str:
             return m.group(1)
     raise ValueError("Could not extract video ID from: " + url_or_id)
 
+
+def fetch_transcript(video_id: str) -> str:
+    """Try fetching transcript with multiple fallback strategies."""
+
+    # Strategy 1: No proxy (sometimes works)
+    try:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.fetch(video_id, languages=["en"])
+        return " ".join(chunk.text for chunk in transcript_list)
+    except Exception:
+        pass
+
+    # Strategy 2: Use Webshare proxy if credentials are set
+    webshare_user = os.environ.get("WEBSHARE_USER", "")
+    webshare_pass = os.environ.get("WEBSHARE_PASS", "")
+    if webshare_user and webshare_pass:
+        try:
+            proxy_config = WebshareProxyConfig(
+                proxy_username=webshare_user,
+                proxy_password=webshare_pass,
+            )
+            api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            transcript_list = api.fetch(video_id, languages=["en"])
+            return " ".join(chunk.text for chunk in transcript_list)
+        except Exception:
+            pass
+
+    # Strategy 3: Generic HTTP proxy if set
+    http_proxy = os.environ.get("HTTP_PROXY", "")
+    if http_proxy:
+        try:
+            proxy_config = GenericProxyConfig(
+                http_url=http_proxy,
+                https_url=http_proxy,
+            )
+            api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            transcript_list = api.fetch(video_id, languages=["en"])
+            return " ".join(chunk.text for chunk in transcript_list)
+        except Exception:
+            pass
+
+    raise Exception(
+        "YouTube is blocking requests from this server's IP. "
+        "This is a common issue with cloud hosting. "
+        "Please try a different video or set up a proxy (WEBSHARE_USER + WEBSHARE_PASS env vars)."
+    )
+
+
 def build_chain(retriever):
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
@@ -109,13 +157,11 @@ def load_video(req: LoadRequest):
 
     # 1. Fetch transcript
     try:
-        api_handler = YouTubeTranscriptApi()
-        transcript_list = api_handler.fetch(video_id, languages=["en"])
-        transcript = " ".join(chunk.text for chunk in transcript_list)
+        transcript = fetch_transcript(video_id)
     except TranscriptsDisabled:
         raise HTTPException(status_code=400, detail="No English captions available for this video.")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Transcript error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
     # 2. Chunk
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
