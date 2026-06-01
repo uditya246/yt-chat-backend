@@ -6,7 +6,6 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
-from youtube_transcript_api.proxies import WebshareProxyConfig, GenericProxyConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import FastEmbedEmbeddings
@@ -36,6 +35,23 @@ client = InferenceClient(
     model="meta-llama/Llama-3.2-1B-Instruct",
     token=HF_TOKEN
 )
+
+# ── Proxy list from Webshare (all 10 proxies) ─────────────────────────────
+WEBSHARE_USER = os.environ.get("WEBSHARE_USER", "rlkuclew")
+WEBSHARE_PASS = os.environ.get("WEBSHARE_PASS", "2nomrvan9ibz")
+
+PROXIES = [
+    ("38.154.203.95",  "5863"),
+    ("198.105.121.200","6462"),
+    ("64.137.96.74",   "6641"),
+    ("209.127.138.10", "5784"),
+    ("38.154.185.97",  "6370"),
+    ("84.247.60.125",  "6095"),
+    ("142.111.67.146", "5611"),
+    ("191.96.254.138", "6185"),
+    ("31.58.9.4",      "6077"),
+    ("104.239.107.47", "5699"),
+]
 
 # ── In-memory store ────────────────────────────────────────────────────────
 video_store: dict = {}
@@ -70,49 +86,37 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(video_id: str) -> str:
-    """Try fetching transcript with multiple fallback strategies."""
+    import requests
 
-    # Strategy 1: No proxy (sometimes works)
+    # Strategy 1: Try direct (no proxy)
     try:
         api = YouTubeTranscriptApi()
         transcript_list = api.fetch(video_id, languages=["en"])
+        print("✓ Transcript fetched directly!")
         return " ".join(chunk.text for chunk in transcript_list)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Direct fetch failed: {e}")
 
-    # Strategy 2: Use Webshare proxy if credentials are set
-    webshare_user = os.environ.get("WEBSHARE_USER", "")
-    webshare_pass = os.environ.get("WEBSHARE_PASS", "")
-    if webshare_user and webshare_pass:
+    # Strategy 2: Try each proxy one by one
+    for ip, port in PROXIES:
         try:
-            proxy_config = WebshareProxyConfig(
-                proxy_username=webshare_user,
-                proxy_password=webshare_pass,
-            )
-            api = YouTubeTranscriptApi(proxy_config=proxy_config)
-            transcript_list = api.fetch(video_id, languages=["en"])
-            return " ".join(chunk.text for chunk in transcript_list)
-        except Exception:
-            pass
+            proxy_url = f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@{ip}:{port}"
+            proxies = {"http": proxy_url, "https": proxy_url}
+            session = requests.Session()
+            session.proxies.update(proxies)
+            session.timeout = 10
 
-    # Strategy 3: Generic HTTP proxy if set
-    http_proxy = os.environ.get("HTTP_PROXY", "")
-    if http_proxy:
-        try:
-            proxy_config = GenericProxyConfig(
-                http_url=http_proxy,
-                https_url=http_proxy,
-            )
-            api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            api = YouTubeTranscriptApi(http_client=session)
             transcript_list = api.fetch(video_id, languages=["en"])
+            print(f"✓ Transcript fetched via proxy {ip}:{port}!")
             return " ".join(chunk.text for chunk in transcript_list)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Proxy {ip}:{port} failed: {e}")
+            continue
 
     raise Exception(
-        "YouTube is blocking requests from this server's IP. "
-        "This is a common issue with cloud hosting. "
-        "Please try a different video or set up a proxy (WEBSHARE_USER + WEBSHARE_PASS env vars)."
+        "Could not fetch transcript. All proxies failed. "
+        "Please try a different video or check your proxy credentials."
     )
 
 
@@ -155,7 +159,6 @@ def load_video(req: LoadRequest):
     if video_id in video_store:
         return {"video_id": video_id, "message": "Already loaded", "chunks": video_store[video_id]["chunks"]}
 
-    # 1. Fetch transcript
     try:
         transcript = fetch_transcript(video_id)
     except TranscriptsDisabled:
@@ -163,15 +166,12 @@ def load_video(req: LoadRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 2. Chunk
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.create_documents([transcript])
 
-    # 3. Embed + index
     vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
-    # 4. Build chain
     chain = build_chain(retriever)
     video_store[video_id] = {"chain": chain, "chunks": len(chunks)}
 
