@@ -161,3 +161,7 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Model error: {str(e)}")
 
     return {"answer": answer}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
