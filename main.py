@@ -7,8 +7,8 @@ warnings.filterwarnings('ignore')
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
@@ -24,15 +24,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Pre-load embedding model at startup (avoids timeout on first request) ──
+# ── Pre-load embedding model at startup ────────────────────────────────────
+# FastEmbed is lightweight (~50MB) — works fine on free tier
 print("Loading embedding model...")
-EMBEDDINGS = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
-)
+EMBEDDINGS = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 print("Embedding model loaded!")
 
-# ── HuggingFace client ─────────────────────────────────────────────────────
+# ── HuggingFace LLM client ─────────────────────────────────────────────────
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 client = InferenceClient(
     model="meta-llama/Llama-3.2-1B-Instruct",
@@ -123,7 +121,7 @@ def load_video(req: LoadRequest):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.create_documents([transcript])
 
-    # 3. Embed + index (uses pre-loaded model)
+    # 3. Embed + index
     vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
