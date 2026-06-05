@@ -1,6 +1,5 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import re
@@ -20,7 +19,6 @@ from huggingface_hub import InferenceClient
 # ── App setup ──────────────────────────────────────────────────────────────
 app = FastAPI(title="YT Chat API")
 
-# CORS — must be first middleware, allow everything
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -78,13 +76,38 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 def fetch_transcript(video_id: str) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
 
-    # Strategy 1: Direct YouTube timedtext
+    # Strategy 1: Supadata API (most reliable for cloud servers)
+    supadata_key = os.environ.get("SUPADATA_API_KEY", "")
+    if supadata_key:
+        try:
+            url = "https://api.supadata.ai/v1/youtube/transcript"
+            headers = {"x-api-key": supadata_key}
+            params = {"videoId": video_id, "lang": "en", "text": "true"}
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            print(f"Supadata response: {resp.status_code} {resp.text[:200]}")
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data.get("content", "")
+                if isinstance(content, list):
+                    transcript = " ".join(
+                        item.get("text", "") if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                else:
+                    transcript = str(content)
+                if len(transcript) > 100:
+                    print("✓ Fetched via Supadata!")
+                    return transcript
+        except Exception as e:
+            print(f"Supadata failed: {e}")
+
+    # Strategy 2: Direct YouTube timedtext
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         url = f"https://www.youtube.com/watch?v={video_id}"
         resp = requests.get(url, headers=headers, timeout=15)
         match = re.search(r'"captionTracks":\[.*?"baseUrl":"(.*?)"', resp.text)
@@ -100,20 +123,9 @@ def fetch_transcript(video_id: str) -> str:
     except Exception as e:
         print(f"Direct failed: {e}")
 
-    # Strategy 2: youtubetranscript.com
-    try:
-        url = f"https://youtubetranscript.com/?server_vid2={video_id}"
-        resp = requests.get(url, headers=headers, timeout=15)
-        matches = re.findall(r'<text[^>]*>(.*?)</text>', resp.text, re.DOTALL)
-        if matches:
-            transcript = " ".join(html.unescape(m.strip()) for m in matches)
-            if len(transcript) > 100:
-                print("✓ Fetched via youtubetranscript.com!")
-                return transcript
-    except Exception as e:
-        print(f"youtubetranscript.com failed: {e}")
-
-    raise Exception("Could not fetch transcript. Please try a different video with English captions.")
+    raise Exception(
+        "Could not fetch transcript. Please try a different video with English captions."
+    )
 
 
 def build_chain(retriever):
@@ -143,6 +155,7 @@ class ChatRequest(BaseModel):
 @app.get("/")
 def root():
     return {"status": "YT Chat API is running"}
+
 
 @app.post("/load")
 def load_video(req: LoadRequest):
@@ -183,6 +196,7 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Model error: {str(e)}")
 
     return {"answer": answer}
+
 
 if __name__ == "__main__":
     import uvicorn
