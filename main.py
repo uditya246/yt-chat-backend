@@ -2,8 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-import warnings
 import re
+import json
+import pickle
+import warnings
 import requests
 warnings.filterwarnings('ignore')
 
@@ -17,13 +19,16 @@ from huggingface_hub import InferenceClient
 
 # ── App setup ──────────────────────────────────────────────────────────────
 app = FastAPI(title="YT Chat API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Storage directory (persists across restarts within same deploy) ─────────
+STORE_DIR = "/tmp/yt_chat_store"
+os.makedirs(STORE_DIR, exist_ok=True)
 
 # ── Pre-load embedding model ───────────────────────────────────────────────
 print("Loading embedding model...")
@@ -37,12 +42,12 @@ client = InferenceClient(
     token=HF_TOKEN
 )
 
-# ── In-memory store ────────────────────────────────────────────────────────
-video_store: dict = {}
+# ── In-memory chain cache ──────────────────────────────────────────────────
+chain_cache: dict = {}
 
 # ── Prompt template ────────────────────────────────────────────────────────
 prompt = PromptTemplate(
-    template="""You are a helpful assistant.
+    template="""You are a helpful assistant. Always respond in English only, regardless of the language of the question.
 Answer only from the provided transcript context.
 If the context is insufficient, say you don't know.
 
@@ -68,103 +73,81 @@ def extract_video_id(url_or_id: str) -> str:
     raise ValueError("Could not extract video ID from: " + url_or_id)
 
 
-def fetch_transcript_supadata(video_id: str) -> str:
-    """Fetch transcript using Supadata API — works from cloud IPs."""
-    api_key = os.environ.get("SUPADATA_API_KEY", "")
-    if not api_key:
-        raise Exception("SUPADATA_API_KEY not set")
-    
-    url = f"https://api.supadata.ai/v1/youtube/transcript"
-    headers = {"x-api-key": api_key}
-    params = {"videoId": video_id, "lang": "en", "text": "true"}
-    
-    response = requests.get(url, headers=headers, params=params, timeout=30)
-    if response.status_code == 200:
-        data = response.json()
-        # Supadata returns content as plain text or list
-        content = data.get("content", "")
-        if isinstance(content, list):
-            return " ".join(item.get("text", "") for item in content)
-        return str(content)
-    raise Exception(f"Supadata API error: {response.status_code} {response.text}")
+def save_transcript(video_id: str, transcript: str, chunks_count: int):
+    """Save transcript to disk so it survives server restarts."""
+    path = os.path.join(STORE_DIR, f"{video_id}.json")
+    with open(path, "w") as f:
+        json.dump({"transcript": transcript, "chunks": chunks_count}, f)
 
 
-def fetch_transcript_youtubetranscript(video_id: str) -> str:
-    """Fetch transcript using youtubetranscript.com API."""
-    url = f"https://youtubetranscript.com/?server_vid2={video_id}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=15)
-    if response.status_code == 200:
-        # Parse the XML/text response
-        text = response.text
-        # Extract text between <text> tags
-        matches = re.findall(r'<text[^>]*>(.*?)</text>', text, re.DOTALL)
-        if matches:
-            import html
-            return " ".join(html.unescape(m.strip()) for m in matches)
-    raise Exception("youtubetranscript.com fetch failed")
-
-
-def fetch_transcript_direct(video_id: str) -> str:
-    """Fetch transcript directly from YouTube timedtext API."""
-    # Get video page to find caption track URL
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    resp = requests.get(url, headers=headers, timeout=15)
-    
-    # Extract caption URL from page source
-    match = re.search(r'"captionTracks":\[.*?"baseUrl":"(.*?)"', resp.text)
-    if not match:
-        raise Exception("No caption tracks found in video page")
-    
-    caption_url = match.group(1).replace("\\u0026", "&")
-    
-    # Fetch the caption XML
-    caption_resp = requests.get(caption_url, headers=headers, timeout=15)
-    caption_text = caption_resp.text
-    
-    # Extract text
-    matches = re.findall(r'<text[^>]*>(.*?)</text>', caption_text, re.DOTALL)
-    if not matches:
-        raise Exception("No text found in captions")
-    
-    import html
-    return " ".join(html.unescape(m.strip()) for m in matches)
+def load_transcript_from_disk(video_id: str):
+    """Load transcript from disk if it exists."""
+    path = os.path.join(STORE_DIR, f"{video_id}.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
 
 
 def fetch_transcript(video_id: str) -> str:
     """Try multiple transcript fetching strategies."""
 
-    # Strategy 1: Direct YouTube timedtext API (no external service needed)
+    # Strategy 1: Direct YouTube timedtext API
     try:
-        transcript = fetch_transcript_direct(video_id)
-        if len(transcript) > 100:
-            print("✓ Fetched via direct YouTube API!")
-            return transcript
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        resp = requests.get(url, headers=headers, timeout=15)
+        match = re.search(r'"captionTracks":\[.*?"baseUrl":"(.*?)"', resp.text)
+        if match:
+            caption_url = match.group(1).replace("\\u0026", "&")
+            caption_resp = requests.get(caption_url, headers=headers, timeout=15)
+            matches = re.findall(r'<text[^>]*>(.*?)</text>', caption_resp.text, re.DOTALL)
+            if matches:
+                import html
+                transcript = " ".join(html.unescape(m.strip()) for m in matches)
+                if len(transcript) > 100:
+                    print("✓ Fetched via direct YouTube API!")
+                    return transcript
     except Exception as e:
         print(f"Direct fetch failed: {e}")
 
-    # Strategy 2: Supadata API (free tier available)
+    # Strategy 2: youtubetranscript.com
     try:
-        transcript = fetch_transcript_supadata(video_id)
-        if len(transcript) > 100:
-            print("✓ Fetched via Supadata!")
-            return transcript
-    except Exception as e:
-        print(f"Supadata failed: {e}")
-
-    # Strategy 3: youtubetranscript.com
-    try:
-        transcript = fetch_transcript_youtubetranscript(video_id)
-        if len(transcript) > 100:
-            print("✓ Fetched via youtubetranscript.com!")
-            return transcript
+        url = f"https://youtubetranscript.com/?server_vid2={video_id}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            matches = re.findall(r'<text[^>]*>(.*?)</text>', response.text, re.DOTALL)
+            if matches:
+                import html
+                transcript = " ".join(html.unescape(m.strip()) for m in matches)
+                if len(transcript) > 100:
+                    print("✓ Fetched via youtubetranscript.com!")
+                    return transcript
     except Exception as e:
         print(f"youtubetranscript.com failed: {e}")
+
+    # Strategy 3: Supadata API
+    try:
+        api_key = os.environ.get("SUPADATA_API_KEY", "")
+        if api_key:
+            url = "https://api.supadata.ai/v1/youtube/transcript"
+            headers = {"x-api-key": api_key}
+            params = {"videoId": video_id, "lang": "en", "text": "true"}
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(item.get("text", "") for item in content)
+                if len(str(content)) > 100:
+                    print("✓ Fetched via Supadata!")
+                    return str(content)
+    except Exception as e:
+        print(f"Supadata failed: {e}")
 
     raise Exception(
         "Could not fetch transcript for this video. "
@@ -187,6 +170,20 @@ def build_chain(retriever):
     })
     return parallel_chain | prompt | RunnableLambda(invoke_model) | StrOutputParser()
 
+
+def get_or_build_chain(video_id: str, transcript: str):
+    """Build chain from transcript, cache it in memory."""
+    if video_id in chain_cache:
+        return chain_cache[video_id]
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.create_documents([transcript])
+    vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
+    retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+    chain = build_chain(retriever)
+    chain_cache[video_id] = chain
+    return chain
+
 # ── Request models ─────────────────────────────────────────────────────────
 class LoadRequest(BaseModel):
     url: str
@@ -208,9 +205,14 @@ def load_video(req: LoadRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if video_id in video_store:
-        return {"video_id": video_id, "message": "Already loaded", "chunks": video_store[video_id]["chunks"]}
+    # Check disk cache first
+    cached = load_transcript_from_disk(video_id)
+    if cached:
+        # Rebuild chain from cached transcript
+        get_or_build_chain(video_id, cached["transcript"])
+        return {"video_id": video_id, "message": "Loaded from cache", "chunks": cached["chunks"]}
 
+    # Fetch fresh transcript
     try:
         transcript = fetch_transcript(video_id)
     except Exception as e:
@@ -218,22 +220,31 @@ def load_video(req: LoadRequest):
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.create_documents([transcript])
+    chunks_count = len(chunks)
 
+    # Save to disk
+    save_transcript(video_id, transcript, chunks_count)
+
+    # Build and cache chain
     vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
-
     chain = build_chain(retriever)
-    video_store[video_id] = {"chain": chain, "chunks": len(chunks)}
+    chain_cache[video_id] = chain
 
-    return {"video_id": video_id, "message": "Video loaded successfully", "chunks": len(chunks)}
+    return {"video_id": video_id, "message": "Video loaded successfully", "chunks": chunks_count}
 
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    if req.video_id not in video_store:
-        raise HTTPException(status_code=404, detail="Video not loaded. Call /load first.")
+    # Try to restore from disk if not in memory
+    if req.video_id not in chain_cache:
+        cached = load_transcript_from_disk(req.video_id)
+        if cached:
+            get_or_build_chain(req.video_id, cached["transcript"])
+        else:
+            raise HTTPException(status_code=404, detail="Video not loaded. Please load the video first.")
 
-    chain = video_store[req.video_id]["chain"]
+    chain = chain_cache[req.video_id]
     try:
         answer = chain.invoke(req.question)
     except Exception as e:
