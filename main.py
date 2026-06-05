@@ -30,7 +30,7 @@ app.add_middleware(
 # ── HuggingFace LLM client ─────────────────────────────────────────────────
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 client = InferenceClient(
-    model="meta-llama/Llama-3.2-1B-Instruct",
+    model="mistralai/Mistral-7B-Instruct-v0.3",
     token=HF_TOKEN
 )
 
