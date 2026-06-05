@@ -178,7 +178,7 @@ def get_or_build_chain(video_id: str, transcript: str):
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.create_documents([transcript])
-    vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
+    vector_store = FAISS.from_documents(chunks, get_embeddings())
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     chain = build_chain(retriever)
     chain_cache[video_id] = chain
@@ -226,7 +226,7 @@ def load_video(req: LoadRequest):
     save_transcript(video_id, transcript, chunks_count)
 
     # Build and cache chain
-    vector_store = FAISS.from_documents(chunks, EMBEDDINGS)
+    vector_store = FAISS.from_documents(chunks, get_embeddings())
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
     chain = build_chain(retriever)
     chain_cache[video_id] = chain
