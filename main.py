@@ -30,7 +30,8 @@ app.add_middleware(
 # ── HuggingFace LLM client ─────────────────────────────────────────────────
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 client = InferenceClient(
-    model="meta-llama/Llama-3.2-3B-Instruct",
+    model="meta-llama/Llama-3.2-1B-Instruct",
+    provider="groq",
     token=HF_TOKEN
 )
 
