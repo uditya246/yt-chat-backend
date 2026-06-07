@@ -30,7 +30,7 @@ app.add_middleware(
 # ── HuggingFace LLM client ─────────────────────────────────────────────────
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 client = InferenceClient(
-    model="meta-llama/Llama-3.2-1B-Instruct",
+    model="meta-llama/Llama-4-Scout-17B-16E-Instruct",
     provider="groq",
     token=HF_TOKEN
 )
@@ -78,7 +78,7 @@ def extract_video_id(url_or_id: str) -> str:
 
 def fetch_transcript(video_id: str) -> str:
 
-    # Strategy 1: Supadata API (most reliable for cloud servers)
+    # Strategy 1: Supadata API
     supadata_key = os.environ.get("SUPADATA_API_KEY", "")
     if supadata_key:
         try:
@@ -105,16 +105,16 @@ def fetch_transcript(video_id: str) -> str:
 
     # Strategy 2: Direct YouTube timedtext
     try:
-        headers = {
+        req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
         url = f"https://www.youtube.com/watch?v={video_id}"
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = requests.get(url, headers=req_headers, timeout=15)
         match = re.search(r'"captionTracks":\[.*?"baseUrl":"(.*?)"', resp.text)
         if match:
             caption_url = match.group(1).replace("\\u0026", "&")
-            caption_resp = requests.get(caption_url, headers=headers, timeout=15)
+            caption_resp = requests.get(caption_url, headers=req_headers, timeout=15)
             matches = re.findall(r'<text[^>]*>(.*?)</text>', caption_resp.text, re.DOTALL)
             if matches:
                 transcript = " ".join(html.unescape(m.strip()) for m in matches)
@@ -134,7 +134,7 @@ def build_chain(retriever):
         return "\n\n".join(d.page_content for d in docs)
 
     def invoke_model(formatted_prompt):
-        messages = [{"role": "user", "content": formatted_prompt.text}]
+        messages = [{"role": "user", "content": str(formatted_prompt)}]
         response = client.chat_completion(messages, max_tokens=512, temperature=0.1)
         return response.choices[0].message.content
 
